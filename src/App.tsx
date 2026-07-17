@@ -3,12 +3,14 @@ import React, { useState, useEffect } from "react";
 const INITIAL_BET = 10;
 const STORAGE_KEY = "betting_tool_state_v4";
 
-// === RÚT THANG (LADDER) khi vốn lên vùng 10.000k ===
-// Khi THẮNG mà công thức đưa cược xuống DƯỚI 10.000k -> chốt về 10.000k,
-// rồi mỗi lần thắng tiếp giảm dần 1.000k: 10.000k -> 9.000k -> 8.000k -> ...
-// Mỗi bậc rút thang cộng vào "Lãi rút thang": (số về thực tế - số theo công thức) x 2
-const LADDER_TOP = 10000; // 10.000k = 10tr
-const LADDER_STEP = 1000; // mỗi lần thắng giảm 1.000k
+// === RÚT THANG (LADDER) ===
+// "Mốc đang giữ" = mốc nghìn ngay DƯỚI cược hiện tại, nhưng không bao giờ cao hơn
+// 10.000k (cược > 10.000k thì luôn giữ mốc 10.000k như bản cũ).
+// Khi THẮNG: nếu số công thức rơi xuống DƯỚI mốc đang giữ -> về đúng mốc đó,
+// phần dư vào "Lãi rút thang" = (mốc - số công thức) x 2. Nếu không thì giữ số công thức
+// (thắng ít -> đi theo công thức, VD 10.000k thắng nhỏ -> 9.949k, chưa xuống 9.000k).
+const LADDER_TOP = 10000; // trần giữ mốc = 10.000k
+const LADDER_STEP = 1000; // mốc nghìn (1.000k)
 
 function formatMoney(val) {
   return (
@@ -34,6 +36,24 @@ function calcNextBetOnLoss(currentBet, lostAmount) {
   return currentBet + 0.5 * lostAmount;
 }
 
+function computeWinNext(currentBet, won) {
+  const formulaNext = Math.max(0, round2(calcNextBetOnWin(currentBet, won)));
+  // Mốc đang giữ: mốc nghìn ngay dưới cược, nhưng tối đa là 10.000k.
+  const line = Math.min(
+    LADDER_TOP,
+    Math.ceil(currentBet / LADDER_STEP) * LADDER_STEP - LADDER_STEP
+  );
+  if (line > 0 && formulaNext < line) {
+    return {
+      nextBet: line,
+      ladder: true,
+      formulaNext,
+      gain: round2((line - formulaNext) * 2),
+    };
+  }
+  return { nextBet: formulaNext, ladder: false, formulaNext, gain: 0 };
+}
+
 export default function App() {
   // Core States
   const [history, setHistory] = useState([]);
@@ -41,7 +61,6 @@ export default function App() {
   const [round, setRound] = useState(1);
   const [totalLost, setTotalLost] = useState(0);
   const [totalWon, setTotalWon] = useState(0);
-  const [ladderActive, setLadderActive] = useState(false);
   const [ladderProfit, setLadderProfit] = useState(0);
   const [isLoaded, setIsLoaded] = useState(false);
 
@@ -93,8 +112,6 @@ export default function App() {
           if (parsed.round !== undefined) setRound(parsed.round);
           if (parsed.totalLost !== undefined) setTotalLost(parsed.totalLost);
           if (parsed.totalWon !== undefined) setTotalWon(parsed.totalWon);
-          if (parsed.ladderActive !== undefined)
-            setLadderActive(parsed.ladderActive);
           if (parsed.ladderProfit !== undefined)
             setLadderProfit(parsed.ladderProfit);
         }
@@ -121,7 +138,6 @@ export default function App() {
           round,
           totalLost,
           totalWon,
-          ladderActive,
           ladderProfit,
         };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
@@ -135,7 +151,6 @@ export default function App() {
     round,
     totalLost,
     totalWon,
-    ladderActive,
     ladderProfit,
     isLoaded,
   ]);
@@ -170,7 +185,6 @@ export default function App() {
     });
     setTotalLost((p) => p + lost);
     setCurrentBet(nextBet);
-    setLadderActive(false); // thua -> thoát rút thang
     setRound((r) => r + 1);
     setShowWonInput(false);
     setShowLoseInput(false);
@@ -193,7 +207,6 @@ export default function App() {
     });
     setTotalLost((p) => p + lost);
     setCurrentBet(nextBet);
-    setLadderActive(false);
     setRound((r) => r + 1);
     setShowWonInput(false);
     setShowLoseInput(false);
@@ -219,7 +232,6 @@ export default function App() {
     });
     setTotalLost((p) => p + lost);
     setCurrentBet(nextBet);
-    setLadderActive(false);
     setRound((r) => r + 1);
     setShowLoseInput(false);
     setLoseInput("");
@@ -229,43 +241,22 @@ export default function App() {
     const won = parseFloat(wonInput);
     if (isNaN(won) || won <= 0) return;
 
-    const formulaNext = Math.max(0, round2(calcNextBetOnWin(currentBet, won)));
-
-    let willLadder = false;
-    let nextBet = formulaNext;
-    let gain = 0;
-
-    if (ladderActive && currentBet > LADDER_STEP) {
-      // Đang rút thang: xuống 1 bậc (10.000 -> 9.000 -> 8.000 ...)
-      willLadder = true;
-      nextBet = round2(currentBet - LADDER_STEP);
-      gain = round2((nextBet - formulaNext) * 2);
-    } else if (
-      !ladderActive &&
-      currentBet >= LADDER_TOP &&
-      formulaNext < LADDER_TOP
-    ) {
-      // Lần đầu vào thang: công thức đưa xuống dưới 10.000k -> chốt về 10.000k
-      willLadder = true;
-      nextBet = LADDER_TOP;
-      gain = round2((nextBet - formulaNext) * 2);
-    }
+    const res = computeWinNext(currentBet, won);
 
     updateHistory({
       round,
       bet: currentBet,
       result: "thắng",
       won,
-      nextBet,
-      ladder: willLadder,
-      formulaNext: willLadder ? formulaNext : undefined,
-      gain: willLadder ? gain : 0,
+      nextBet: res.nextBet,
+      ladder: res.ladder,
+      formulaNext: res.ladder ? res.formulaNext : undefined,
+      gain: res.ladder ? res.gain : 0,
       time: getTimestamp(),
     });
     setTotalWon((p) => p + won);
-    setCurrentBet(nextBet);
-    setLadderActive(willLadder);
-    if (willLadder) setLadderProfit((p) => round2(p + gain));
+    setCurrentBet(res.nextBet);
+    if (res.ladder) setLadderProfit((p) => round2(p + res.gain));
     setRound((r) => r + 1);
     setShowWonInput(false);
     setWonInput("");
@@ -283,7 +274,6 @@ export default function App() {
     const newBet = parseFloat(editBetInput);
     if (!isNaN(newBet) && newBet >= 0) {
       setCurrentBet(round2(newBet));
-      setLadderActive(false); // sửa vốn tay -> thoát rút thang
       setIsEditingBet(false);
     }
   }
@@ -303,7 +293,6 @@ export default function App() {
       setShowLoseInput(false);
       setTotalLost(0);
       setTotalWon(0);
-      setLadderActive(false);
       setLadderProfit(0);
       setShowWithdrawInput(false);
       setWithdrawInput("");
@@ -316,28 +305,11 @@ export default function App() {
   const wonInputVal = parseFloat(wonInput);
 
   // Dự tính rút thang cho ô nhập THẮNG
-  const winFormulaNext = Math.max(
-    0,
-    round2(calcNextBetOnWin(currentBet, wonInputVal))
-  );
-  let winWillLadder = false;
-  let winNextPreview = winFormulaNext;
-  let winGainPreview = 0;
-  if (ladderActive && currentBet > LADDER_STEP) {
-    winWillLadder = true;
-    winNextPreview = round2(currentBet - LADDER_STEP);
-    winGainPreview = round2((winNextPreview - winFormulaNext) * 2);
-  } else if (
-    !ladderActive &&
-    currentBet >= LADDER_TOP &&
-    winFormulaNext < LADDER_TOP
-  ) {
-    winWillLadder = true;
-    winNextPreview = LADDER_TOP;
-    winGainPreview = round2((winNextPreview - winFormulaNext) * 2);
-  }
-
-  const ladderModeOn = ladderActive || currentBet >= LADDER_TOP;
+  const winPreview = computeWinNext(currentBet, wonInputVal);
+  const winFormulaNext = winPreview.formulaNext;
+  const winWillLadder = winPreview.ladder;
+  const winNextPreview = winPreview.nextBet;
+  const winGainPreview = winPreview.gain;
 
   // Premium Luxury Color Palette (Midnight Sapphire & Brushed Gold Accents)
   const colors = {
@@ -528,7 +500,7 @@ export default function App() {
               : "Số tiền phân phối chuẩn cho lượt này"}
           </div>
 
-          {!isEditingBet && ladderModeOn && (
+          {!isEditingBet && currentBet > LADDER_STEP && (
             <div
               style={{
                 marginTop: 10,
@@ -541,10 +513,14 @@ export default function App() {
                 fontWeight: 700,
               }}
             >
-              🪜 Chế độ RÚT THANG đang bật · Thắng →{" "}
-              {currentBet > LADDER_TOP
-                ? "chốt về 10.000k"
-                : `về ${formatMoney(Math.max(0, currentBet - LADDER_STEP))}`}
+              🪜 Đang giữ mốc{" "}
+              {formatMoney(
+                Math.min(
+                  LADDER_TOP,
+                  Math.ceil(currentBet / LADDER_STEP) * LADDER_STEP - LADDER_STEP
+                )
+              )}{" "}
+              · thắng nhiều tụt xuống mốc này & khoá lãi, thắng ít đi theo công thức
             </div>
           )}
         </div>
@@ -863,7 +839,7 @@ export default function App() {
                 {winWillLadder ? (
                   <>
                     <span style={{ fontStyle: "italic" }}>
-                      🪜 Rút thang: về {formatMoney(winNextPreview)} (thay vì{" "}
+                      🪜 Bám mốc: về {formatMoney(winNextPreview)} (thay vì{" "}
                       {formatMoney(winFormulaNext)} theo công thức)
                     </span>
                     <br />
@@ -878,7 +854,7 @@ export default function App() {
                 ) : (
                   <span style={{ fontStyle: "italic" }}>
                     Công thức: ( {formatMoney(currentBet)} × 2 −{" "}
-                    {formatMoney(wonInputVal)} ) / 2
+                    {formatMoney(wonInputVal)} ) / 1.99
                   </span>
                 )}
               </div>
@@ -1282,10 +1258,11 @@ export default function App() {
           Thua hết → ×1.5 · Thua nửa → ×1.25 · Thua khác → cược + 0.5×(số tiền
           thua)
           <br />
-          Thắng: ( Cược × 2 − Thắng ) / 2
+          Thắng: ( Cược × 2 − Thắng ) / 1.99
           <br />
-          Rút thang: cược ≥ 10.000k mà công thức xuống dưới 10.000k → chốt về
-          10.000k, rồi mỗi lần thắng −1.000k (9k, 8k, 7k...).
+          Rút thang: giữ mốc nghìn ngay dưới cược (tối đa 10.000k). Thắng nhiều
+          làm công thức rơi dưới mốc → về đúng mốc, phần dư vào lãi; thắng ít →
+          đi theo công thức.
           <br />
           Lãi rút thang = ( số về − số công thức ) × 2, cộng dồn & có thể rút ra.
           <br />
