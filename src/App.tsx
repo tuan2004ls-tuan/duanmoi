@@ -12,6 +12,35 @@ const STORAGE_KEY = "betting_tool_state_v4";
 const LADDER_TOP = 10000; // trần giữ mốc = 10.000k
 const LADDER_STEP = 1000; // mốc nghìn (1.000k)
 
+// === CHIA HỆ SỐ theo mốc vốn khi vốn to ===
+// Bật chế độ chia khi vốn > 50.000k. Hệ số theo mốc: 50tr→1.5, 100tr→2, 150tr→2.5,
+// 200tr→3... mỗi +50.000k thì +0.5 (sàn 1.5).
+// HAI TẦNG: Vốn gốc chạy /1.99 như cũ. Số ĐÁNH (stack) chạy /2 riêng: thắng →
+// (đánh×2 − thắng)/2. Stack < 20.000k thì reset = vốn ÷ hệ số. Stack thua → ×1.5 (theo
+// công thức thua) nhưng CHẶN ở vốn ÷ hệ số. Vốn về ≤ 20.000k thì tắt hẳn chế độ chia.
+const STACK_ENTER = 50000; // > mức này thì BẬT chế độ chia
+const STACK_EXIT = 20000; // vốn <= mức này thì TẮT; stack < mức này thì RESET
+const STACK_TIER = 50000; // mỗi +50.000k vốn thì hệ số +0.5
+const STACK_FINE = 20000; // số ĐÁNH khi tụt tới mức này thì đổi sang bước tinh
+const STACK_FINE_STEP = 2000; // bước tinh = 20tr/10 (20 -> 18 -> 16...)
+
+function round1(x) {
+  return Math.round(x * 10) / 10;
+}
+
+// Hệ số chia theo mốc vốn (sàn 1.5)
+function stackDivisor(capital) {
+  const tier = Math.max(0, Math.floor((capital - STACK_ENTER) / STACK_TIER));
+  return round1(1.5 + 0.5 * tier);
+}
+
+// Bật/tắt chế độ chia có "trễ": bật khi > 50m, tắt khi <= 20m, giữa thì giữ nguyên
+function nextStackActive(prevActive, capital) {
+  if (capital > STACK_ENTER) return true;
+  if (capital <= STACK_EXIT) return false;
+  return prevActive;
+}
+
 function formatMoney(val) {
   return (
     (Number(val) || 0).toLocaleString("vi-VN", {
@@ -26,7 +55,7 @@ function round2(v) {
 }
 
 function calcNextBetOnWin(currentBet, wonAmount) {
-  return (currentBet * 2 - wonAmount) / 2;
+  return (currentBet * 2 - wonAmount) / 1.99;
 }
 
 // Tổng quát hoá công thức thua: thua hết (mất 100% cược) -> x1.5,
@@ -62,6 +91,11 @@ export default function App() {
   const [totalLost, setTotalLost] = useState(0);
   const [totalWon, setTotalWon] = useState(0);
   const [ladderProfit, setLadderProfit] = useState(0);
+  const [stackActive, setStackActive] = useState(false);
+  const [stackBet, setStackBet] = useState(0);
+  const [stackRung, setStackRung] = useState(0); // mốc hiện tại (0 = chưa lên thang)
+  const [stackStep, setStackStep] = useState(0); // bước cố định = mốc kích hoạt / 10
+  const [confirmReset, setConfirmReset] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
 
   // UI Interactive States
@@ -114,6 +148,17 @@ export default function App() {
           if (parsed.totalWon !== undefined) setTotalWon(parsed.totalWon);
           if (parsed.ladderProfit !== undefined)
             setLadderProfit(parsed.ladderProfit);
+          const cap =
+            parsed.currentBet !== undefined ? parsed.currentBet : INITIAL_BET;
+          const sa = nextStackActive(parsed.stackActive ?? false, cap);
+          let sb = parsed.stackBet;
+          if (sa && (sb === undefined || sb <= 0)) {
+            sb = round2(cap / stackDivisor(cap));
+          }
+          setStackActive(sa);
+          setStackBet(sb ?? 0);
+          setStackRung(sa ? (parsed.stackRung ?? 0) : 0);
+          setStackStep(sa ? (parsed.stackStep ?? 0) : 0);
         }
       } catch (e) {
         // Chưa có dữ liệu lưu trước đó - bình thường ở lần chạy đầu
@@ -139,6 +184,10 @@ export default function App() {
           totalLost,
           totalWon,
           ladderProfit,
+          stackActive,
+          stackBet,
+          stackRung,
+          stackStep,
         };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
       } catch (e) {
@@ -152,6 +201,10 @@ export default function App() {
     totalLost,
     totalWon,
     ladderProfit,
+    stackActive,
+    stackBet,
+    stackRung,
+    stackStep,
     isLoaded,
   ]);
 
@@ -170,21 +223,64 @@ export default function App() {
     });
   }
 
-  function handleLose() {
-    const lost = currentBet;
-    const nextBet = Math.max(0, round2(calcNextBetOnLoss(currentBet, lost)));
+  // Hệ số reset & số tiền ĐẶT thực tế cho lượt này
+  const stackDiv = stackActive ? stackDivisor(currentBet) : 1;
+  const placedBet = stackActive ? Math.max(0, round2(stackBet)) : currentBet;
+  // Số đánh khi reset = vốn ÷ hệ số của vốn đó
+  const resetBetFor = (total) => Math.max(0, round2(total / stackDivisor(total)));
+  // Mốc lượt kế: trên thang thì bước cố định (bước tinh 2tr khi ≤20tr); chưa lên thì theo bet vs vốn/10
+  const stackA = stackActive ? round2(currentBet / 10) : 0;
+  const stackNextMilestone = !stackActive
+    ? 0
+    : stackRung > 0
+    ? stackRung > STACK_FINE &&
+      round2(stackRung - stackStep) < STACK_FINE
+      ? STACK_FINE
+      : round2(stackRung - (stackRung <= STACK_FINE ? STACK_FINE_STEP : stackStep))
+    : placedBet > stackA
+    ? placedBet > Math.max(stackA, STACK_FINE)
+      ? Math.max(stackA, STACK_FINE)
+      : round2(placedBet - STACK_FINE_STEP)
+    : round2(placedBet - round2(placedBet / 10));
+  // Stack hiện tại có phải vừa reset từ vốn (để hiển thị nhãn ÷hệ số) không
+  const stackIsFresh =
+    stackActive && Math.abs(placedBet - resetBetFor(currentBet)) < 0.5;
+
+  // Xử lý THUA chung cho cả 3 nút
+  function commitLoss(lost, resultLabel) {
+    const totalNext = Math.max(0, round2(calcNextBetOnLoss(currentBet, lost)));
+    const sa = nextStackActive(stackActive, totalNext);
+    let newStack = 0;
+    if (stackActive) {
+      // Stack thua: tăng ×1.5 theo công thức thua
+      const grown = Math.max(0, round2(calcNextBetOnLoss(placedBet, lost)));
+      // Chỉ CHẶN ở vốn÷hệ số khi vốn còn TRÊN 50tr (vùng chia thật); dưới 50tr thì ×1.5 thẳng
+      newStack =
+        currentBet > STACK_ENTER ? Math.min(grown, resetBetFor(totalNext)) : grown;
+    } else if (sa) {
+      // Từ chế độ thường vừa vượt 50m -> vào chia
+      newStack = resetBetFor(totalNext);
+    }
+    const nextPlaced = sa ? newStack : totalNext;
 
     updateHistory({
       round,
-      bet: currentBet,
-      result: "thua hết",
+      bet: placedBet,
+      capital: stackActive ? currentBet : undefined,
+      div: stackActive ? stackDiv : undefined,
+      stack: stackActive,
+      result: resultLabel,
       lost,
       won: 0,
-      nextBet,
+      nextBet: nextPlaced,
       time: getTimestamp(),
     });
     setTotalLost((p) => p + lost);
-    setCurrentBet(nextBet);
+    setCurrentBet(totalNext);
+    setStackActive(sa);
+    setStackBet(sa ? newStack : 0);
+    setStackRung(0); // thua -> rời thang, neo lại mốc khi gỡ
+    setStackStep(0);
     setRound((r) => r + 1);
     setShowWonInput(false);
     setShowLoseInput(false);
@@ -192,55 +288,110 @@ export default function App() {
     setLoseInput("");
   }
 
-  function handleHalfLose() {
-    const lost = currentBet / 2;
-    const nextBet = Math.max(0, round2(calcNextBetOnLoss(currentBet, lost)));
+  function handleLose() {
+    commitLoss(placedBet, "thua hết");
+  }
 
-    updateHistory({
-      round,
-      bet: currentBet,
-      result: "thua nửa",
-      lost,
-      won: 0,
-      nextBet,
-      time: getTimestamp(),
-    });
-    setTotalLost((p) => p + lost);
-    setCurrentBet(nextBet);
-    setRound((r) => r + 1);
-    setShowWonInput(false);
-    setShowLoseInput(false);
-    setWonInput("");
-    setLoseInput("");
+  function handleHalfLose() {
+    commitLoss(placedBet / 2, "thua nửa");
   }
 
   function handleLoseConfirm() {
     const raw = parseFloat(loseInput);
     if (isNaN(raw) || raw <= 0) return;
-    // Không thể thua nhiều hơn số tiền đã đặt cược
-    const lost = Math.min(raw, currentBet);
-    const nextBet = Math.max(0, round2(calcNextBetOnLoss(currentBet, lost)));
-
-    updateHistory({
-      round,
-      bet: currentBet,
-      result: "thua khác",
-      lost,
-      won: 0,
-      nextBet,
-      time: getTimestamp(),
-    });
-    setTotalLost((p) => p + lost);
-    setCurrentBet(nextBet);
-    setRound((r) => r + 1);
-    setShowLoseInput(false);
-    setLoseInput("");
+    commitLoss(raw, "thua khác"); // không giới hạn
   }
 
   function handleWinConfirm() {
     const won = parseFloat(wonInput);
     if (isNaN(won) || won <= 0) return;
 
+    if (stackActive) {
+      // TẦNG 1 - vốn gốc /1.99 ; TẦNG 2 - số đánh /2 ; MỐC bước CỐ ĐỊNH
+      const totalF = Math.max(0, round2(calcNextBetOnWin(currentBet, won)));
+      const stackF = Math.max(0, round2((placedBet * 2 - won) / 2));
+      // Trên thang: bước cố định. Chưa lên thang: chọn mốc theo bet vs vốn/10
+      let step;
+      let milestone;
+      if (stackRung > 0) {
+        // Số đánh tụt tới ≤ 20tr thì dùng bước tinh 2tr (20 -> 18 -> 16...)
+        step = stackRung <= STACK_FINE ? STACK_FINE_STEP : stackStep;
+        milestone = round2(stackRung - step);
+        // Không nhảy vọt qua 20tr: đang trên 20 mà bước xuống dưới thì dừng ở 20 trước
+        if (stackRung > STACK_FINE && milestone < STACK_FINE) {
+          milestone = STACK_FINE;
+        }
+      } else {
+        const A = round2(currentBet / 10); // vốn/10
+        if (placedBet > A) {
+          // bet đang phía trên vốn/10 (đang gỡ)
+          const target = Math.max(A, STACK_FINE); // kéo về, tối thiểu 20tr
+          if (placedBet > target) {
+            // bet còn TRÊN mốc -> kéo về mốc
+            milestone = target;
+            step =
+              target <= STACK_FINE ? STACK_FINE_STEP : round2(target / 10);
+          } else {
+            // bet đã ≤ 20tr (trong vùng tinh) -> đi thang tinh xuống, KHÔNG kéo lên
+            step = STACK_FINE_STEP;
+            milestone = round2(placedBet - step);
+          }
+        } else {
+          // bet nhỏ (≤ vốn/10) -> đi thang xuống từ bet, bước = bet/10
+          step = round2(placedBet / 10);
+          milestone = round2(placedBet - step);
+        }
+      }
+
+      let newStack;
+      let newRung;
+      let newStep;
+      if (milestone > 0 && stackF <= milestone) {
+        // Giữ ở mốc để giảm TIỀN ĐẶT (không đụng vào vốn gốc)
+        newStack = milestone;
+        newRung = milestone;
+        newStep = step;
+      } else {
+        // Thắng ít -> đi theo công thức /2, giữ nguyên thang
+        newStack = stackF;
+        newRung = stackRung;
+        newStep = stackStep;
+      }
+      // Vốn gốc luôn chạy đúng công thức /1.99 (chia chỉ đổi tiền đặt, không đổi vốn gốc)
+      const newTotal = totalF;
+
+      const sa = nextStackActive(true, newTotal);
+      if (!sa) {
+        newStack = 0;
+        newRung = 0;
+        newStep = 0;
+      }
+      const nextPlaced = sa ? newStack : newTotal;
+
+      updateHistory({
+        round,
+        bet: placedBet,
+        capital: currentBet,
+        div: stackDiv,
+        stack: true,
+        result: "thắng",
+        won,
+        nextBet: nextPlaced,
+        time: getTimestamp(),
+      });
+      setTotalWon((p) => p + won);
+      setCurrentBet(newTotal);
+      setStackActive(sa);
+      setStackBet(sa ? newStack : 0);
+      setStackRung(sa ? newRung : 0);
+      setStackStep(sa ? newStep : 0);
+      setRound((r) => r + 1);
+      setShowWonInput(false);
+      setWonInput("");
+      return;
+    }
+
+    // Chế độ thường (có rút thang khoá lãi)
     const res = computeWinNext(currentBet, won);
 
     updateHistory({
@@ -273,30 +424,39 @@ export default function App() {
   function handleSaveManualBet() {
     const newBet = parseFloat(editBetInput);
     if (!isNaN(newBet) && newBet >= 0) {
-      setCurrentBet(round2(newBet));
+      const b = round2(newBet);
+      const sa = nextStackActive(stackActive, b);
+      setCurrentBet(b);
+      setStackActive(sa);
+      setStackBet(sa ? resetBetFor(b) : 0);
+      setStackRung(0);
+      setStackStep(0);
       setIsEditingBet(false);
     }
   }
 
-  function handleReset() {
-    if (
-      window.confirm(
-        "Bạn có chắc chắn muốn xóa toàn bộ dữ liệu và bắt đầu lại?"
-      )
-    ) {
-      setHistory([]);
-      setCurrentBet(INITIAL_BET);
-      setRound(1);
-      setWonInput("");
-      setLoseInput("");
-      setShowWonInput(false);
-      setShowLoseInput(false);
-      setTotalLost(0);
-      setTotalWon(0);
-      setLadderProfit(0);
-      setShowWithdrawInput(false);
-      setWithdrawInput("");
+  function doReset() {
+    setHistory([]);
+    setCurrentBet(INITIAL_BET);
+    setRound(1);
+    setWonInput("");
+    setLoseInput("");
+    setShowWonInput(false);
+    setShowLoseInput(false);
+    setTotalLost(0);
+    setTotalWon(0);
+    setLadderProfit(0);
+    setStackActive(false);
+    setStackBet(0);
+    setStackRung(0);
+    setStackStep(0);
+    setShowWithdrawInput(false);
+    setWithdrawInput("");
+    setConfirmReset(false);
+    try {
       localStorage.removeItem(STORAGE_KEY);
+    } catch (e) {
+      /* ignore */
     }
   }
 
@@ -304,12 +464,27 @@ export default function App() {
   const loseInputVal = parseFloat(loseInput);
   const wonInputVal = parseFloat(wonInput);
 
-  // Dự tính rút thang cho ô nhập THẮNG
+  // Dự tính rút thang cho ô nhập THẮNG (chế độ thường)
   const winPreview = computeWinNext(currentBet, wonInputVal);
   const winFormulaNext = winPreview.formulaNext;
   const winWillLadder = winPreview.ladder;
   const winNextPreview = winPreview.nextBet;
   const winGainPreview = winPreview.gain;
+
+  // Dự tính khi THẮNG trong stack mode (2 tầng + mốc bậc thang)
+  const winTotalF = Math.max(
+    0,
+    round2(calcNextBetOnWin(currentBet, wonInputVal))
+  );
+  const winStackF = Math.max(0, round2((placedBet * 2 - wonInputVal) / 2));
+  const winMilestone = stackNextMilestone;
+  const winHold = winMilestone > 0 && winStackF <= winMilestone;
+  const winTotalNext = winTotalF; // vốn gốc luôn /1.99, không trừ giảm âm
+  const winNextActive = nextStackActive(true, winTotalNext);
+  let winNextPlaced = winHold ? winMilestone : winStackF;
+  if (!winNextActive) {
+    winNextPlaced = winTotalNext;
+  }
 
   // Premium Luxury Color Palette (Midnight Sapphire & Brushed Gold Accents)
   const colors = {
@@ -497,10 +672,66 @@ export default function App() {
           >
             {isEditingBet
               ? "Nhập số tiền vốn mới mong muốn"
+              : stackActive
+              ? "Vốn gốc (dùng cho công thức /1.99)"
               : "Số tiền phân phối chuẩn cho lượt này"}
           </div>
 
-          {!isEditingBet && currentBet > LADDER_STEP && (
+          {!isEditingBet && stackActive && (
+            <div
+              style={{
+                marginTop: 12,
+                padding: "10px 14px",
+                background: "rgba(78, 175, 111, 0.12)",
+                border: `1px solid rgba(78, 175, 111, 0.35)`,
+                borderRadius: 12,
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+            >
+              <span
+                style={{ fontSize: 12, color: colors.green, fontWeight: 700 }}
+              >
+                🎯 ĐÁNH LƯỢT NÀY {stackIsFresh ? `(÷${stackDiv})` : "(stack /2)"}
+              </span>
+              <span
+                style={{ fontSize: 22, color: colors.green, fontWeight: 900 }}
+              >
+                {formatMoney(placedBet)}
+              </span>
+            </div>
+          )}
+
+          {!isEditingBet && stackActive && (
+            <div
+              style={{
+                marginTop: 8,
+                padding: "8px 10px",
+                background: "rgba(78, 175, 111, 0.08)",
+                border: `1px solid rgba(78, 175, 111, 0.22)`,
+                borderRadius: 10,
+                fontSize: 11,
+                color: colors.green,
+                fontWeight: 700,
+              }}
+            >
+              Số đánh chạy /2 · mốc kế {formatMoney(stackNextMilestone)}
+              {stackRung > 0
+                ? stackRung <= STACK_FINE
+                  ? ` (bước tinh ${formatMoney(STACK_FINE_STEP)})`
+                  : ` (bước cố định ${formatMoney(stackStep)})`
+                : placedBet > Math.max(stackA, STACK_FINE)
+                ? ` (kéo về ${formatMoney(Math.max(stackA, STACK_FINE))})`
+                : placedBet > stackA
+                ? ` (bước tinh ${formatMoney(STACK_FINE_STEP)})`
+                : ` (đi thang từ bet, bước ${formatMoney(round2(placedBet / 10))})`}
+              . Giữ mốc CHỈ để giảm tiền đặt; vốn gốc luôn chạy /1.99. Vốn ≤ 20tr thì thôi
+              chia.
+            </div>
+          )}
+
+          {!isEditingBet && !stackActive && currentBet > LADDER_STEP && (
             <div
               style={{
                 marginTop: 10,
@@ -555,7 +786,7 @@ export default function App() {
               <span style={{ fontSize: 18 }}>😞</span>
               <span>Thua Hết</span>
               <span style={{ fontSize: 10, fontWeight: 500, opacity: 0.6 }}>
-                Lượt sau ×1.5
+                {stackActive ? `Mất ${formatMoney(placedBet)}` : "Lượt sau ×1.5"}
               </span>
             </button>
 
@@ -580,7 +811,9 @@ export default function App() {
               <span style={{ fontSize: 18 }}>😐</span>
               <span>Thua Nửa</span>
               <span style={{ fontSize: 10, fontWeight: 500, opacity: 0.6 }}>
-                Lượt sau ×1.25
+                {stackActive
+                  ? `Mất ${formatMoney(placedBet / 2)}`
+                  : "Lượt sau ×1.25"}
               </span>
             </button>
 
@@ -722,29 +955,15 @@ export default function App() {
                   {formatMoney(
                     Math.max(
                       0,
-                      round2(
-                        calcNextBetOnLoss(
-                          currentBet,
-                          Math.min(loseInputVal, currentBet)
-                        )
-                      )
+                      round2(calcNextBetOnLoss(currentBet, loseInputVal))
                     )
                   )}
                 </span>
                 <br />
                 <span style={{ fontStyle: "italic" }}>
                   Công thức: {formatMoney(currentBet)} + 0.5 ×{" "}
-                  {formatMoney(Math.min(loseInputVal, currentBet))}
+                  {formatMoney(loseInputVal)}
                 </span>
-                {loseInputVal > currentBet && (
-                  <>
-                    <br />
-                    <span style={{ color: colors.red }}>
-                      ⚠️ Không thể thua nhiều hơn tiền cược (
-                      {formatMoney(currentBet)}) — đã tự giới hạn lại.
-                    </span>
-                  </>
-                )}
               </div>
             )}
           </div>
@@ -766,7 +985,9 @@ export default function App() {
                 fontWeight: 600,
               }}
             >
-              Nhập chính xác số tiền thắng thực tế (k):
+              {stackActive
+                ? `Nhập số thắng thực tế (bạn đặt ${formatMoney(placedBet)}):`
+                : "Nhập chính xác số tiền thắng thực tế (k):"}
             </div>
             <div style={{ display: "flex", gap: 8 }}>
               <input
@@ -833,10 +1054,25 @@ export default function App() {
               >
                 Dự kiến lượt kế tiếp:{" "}
                 <span style={{ color: colors.gold, fontWeight: 700 }}>
-                  {formatMoney(winNextPreview)}
+                  {formatMoney(stackActive ? winTotalNext : winNextPreview)}
                 </span>
                 <br />
-                {winWillLadder ? (
+                {stackActive ? (
+                  <>
+                    <span style={{ fontStyle: "italic" }}>
+                      Đánh /2 = {formatMoney(winStackF)} · mốc{" "}
+                      {formatMoney(winMilestone)}
+                      {winHold ? " → giữ mốc (chỉ giảm tiền đặt)" : " → theo công thức"}
+                    </span>
+                    <br />
+                    <span style={{ color: colors.green, fontWeight: 700 }}>
+                      🎯 Đánh lượt kế:{" "}
+                      {!winNextActive
+                        ? `${formatMoney(winNextPlaced)} (thoát chia)`
+                        : `${formatMoney(winNextPlaced)}`}
+                    </span>
+                  </>
+                ) : winWillLadder ? (
                   <>
                     <span style={{ fontStyle: "italic" }}>
                       🪜 Bám mốc: về {formatMoney(winNextPreview)} (thay vì{" "}
@@ -1115,7 +1351,11 @@ export default function App() {
                       padding: "12px 14px",
                       background: colors.cardBg,
                       border: `1px solid ${
-                        h.ladder ? "rgba(212,175,55,0.4)" : colors.cardBorder
+                        h.stack
+                          ? "rgba(78,175,111,0.45)"
+                          : h.ladder
+                          ? "rgba(212,175,55,0.4)"
+                          : colors.cardBorder
                       }`,
                       borderRadius: 14,
                     }}
@@ -1144,7 +1384,7 @@ export default function App() {
                             color: colors.textMain,
                           }}
                         >
-                          Cược: {formatMoney(h.bet)}
+                          {h.stack ? "Đặt" : "Cược"}: {formatMoney(h.bet)}
                         </div>
                         <div style={{ fontSize: 11, color: colors.textMuted }}>
                           Kết quả:{" "}
@@ -1155,6 +1395,18 @@ export default function App() {
                             ? ` (+${formatMoney(h.won)})`
                             : ` (-${formatMoney(displayLost)})`}
                         </div>
+                        {h.stack && (
+                          <div
+                            style={{
+                              fontSize: 10,
+                              color: colors.green,
+                              fontWeight: 700,
+                              marginTop: 2,
+                            }}
+                          >
+                            🎯 Stack · vốn {formatMoney(h.capital)} ÷ {h.div}
+                          </div>
+                        )}
                         {h.ladder && (
                           <div
                             style={{
@@ -1207,29 +1459,82 @@ export default function App() {
         </div>
 
         {/* Global Reset */}
-        {history.length > 0 && (
-          <button
-            onClick={handleReset}
-            style={{
-              width: "100%",
-              padding: "14px",
-              background: "transparent",
-              border: `1.5px solid ${colors.cardBorder}`,
-              borderRadius: 14,
-              color: colors.textMuted,
-              fontSize: 12,
-              fontWeight: 600,
-              cursor: "pointer",
-              transition: "all 0.2s ease",
-            }}
-            onMouseEnter={(e) => (e.target.style.borderColor = colors.red)}
-            onMouseLeave={(e) =>
-              (e.target.style.borderColor = colors.cardBorder)
-            }
-          >
-            ↺ Khởi Tạo Lại Toàn Bộ Dữ Liệu
-          </button>
-        )}
+        {history.length > 0 &&
+          (!confirmReset ? (
+            <button
+              onClick={() => setConfirmReset(true)}
+              style={{
+                width: "100%",
+                padding: "14px",
+                background: "transparent",
+                border: `1.5px solid ${colors.cardBorder}`,
+                borderRadius: 14,
+                color: colors.textMuted,
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+            >
+              ↺ Khởi Tạo Lại Toàn Bộ Dữ Liệu
+            </button>
+          ) : (
+            <div
+              style={{
+                width: "100%",
+                padding: "14px",
+                background: "rgba(224, 86, 86, 0.08)",
+                border: `1.5px solid ${colors.red}`,
+                borderRadius: 14,
+                boxSizing: "border-box",
+              }}
+            >
+              <div
+                style={{
+                  fontSize: 12,
+                  color: colors.red,
+                  fontWeight: 700,
+                  textAlign: "center",
+                  marginBottom: 10,
+                }}
+              >
+                Xoá toàn bộ dữ liệu? Không thể hoàn tác.
+              </div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <button
+                  onClick={doReset}
+                  style={{
+                    flex: 1,
+                    padding: "12px",
+                    background: colors.red,
+                    border: "none",
+                    borderRadius: 12,
+                    color: "#fff",
+                    fontSize: 13,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                  }}
+                >
+                  Xoá hết
+                </button>
+                <button
+                  onClick={() => setConfirmReset(false)}
+                  style={{
+                    flex: 1,
+                    padding: "12px",
+                    background: "transparent",
+                    border: `1.5px solid ${colors.cardBorder}`,
+                    borderRadius: 12,
+                    color: colors.textMuted,
+                    fontSize: 13,
+                    fontWeight: 700,
+                    cursor: "pointer",
+                  }}
+                >
+                  Huỷ
+                </button>
+              </div>
+            </div>
+          ))}
 
         {/* Footer */}
         <div
@@ -1265,6 +1570,14 @@ export default function App() {
           đi theo công thức.
           <br />
           Lãi rút thang = ( số về − số công thức ) × 2, cộng dồn & có thể rút ra.
+          <br />
+          Chia 2 tầng (vốn &gt; 50.000k): vốn gốc chạy /1.99; số ĐÁNH chạy /2 riêng.
+          Chọn mốc bậc thang: nếu bet &gt; vốn/10 (thua nhiều) → kéo về vốn/10, bước
+          vốn/100; nếu bet ≤ vốn/10 (đang nhỏ) → đi thang xuống từ bet, bước bet/10.
+          Trong chuỗi thắng giữ nguyên bước; khi số đánh tụt tới ≤ 20tr thì đổi bước
+          tinh 2tr (20→18→16...). Công thức /2 ≤ mốc → giữ ở mốc, phần dư
+          cộng vào tiền đặt (giữ mốc CHỈ giảm tiền đặt, vốn gốc luôn /1.99). Thua → ×1.5 và chọn lại mốc khi gỡ. Vốn ≤
+          20.000k thì thôi chia.
           <br />
           Dữ liệu được lưu riêng cho bạn và tự động khôi phục khi mở lại.
         </div>
